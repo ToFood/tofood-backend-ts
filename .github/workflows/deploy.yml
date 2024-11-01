@@ -1,67 +1,138 @@
-name: Deploy AWS & Update Docker Image
+name: Deploy 🌐
 
 on:
   push:
     branches:
-      - main
+      - '**'
 
 jobs:
   build-push-deploy:
     runs-on: ubuntu-latest
 
     env:
-      DOCKER: ${{ vars.DOCKER_USERNAME }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ACCESS_KEY_ID: ${{ vars.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}  # Incluído o token de sessão
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      IMAGE_NAME: "tofood/backend"
+      CLUSTER_NAME: "tofood-cluster-back"  # Substitua pelo nome do seu cluster EKS
+      DEPLOYMENT_NAME: "tofood-deployment"  # Nome do seu Deployment no EKS
+      NODEGROUP_NAME: "tofood-nodegroup"  # Nome do NodeGroup
 
     steps:
-      - name: Fazer checkout do repositório
+      # Fazer checkout do código-fonte
+      - name: 🎨 Fazer checkout do repositório
         uses: actions/checkout@v4
 
-      - name: Fazer checkout do repositório
-        uses: actions/checkout@v4
-
-      - name: Exibir valor de DOCKER_USERNAME
-        run: echo "O valor de DOCKER_USERNAME é ${{ vars.DOCKER_USERNAME }}"
-
-      - name: Configurar Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Verificar variáveis de ambiente
-        run: |
-          if [ -z "${DOCKER_USERNAME}" ]; then
-            echo "::error:: A variável DOCKER_USERNAME não está definida."
-            exit 1
-          fi
-          if [ -z "${{ secrets.DOCKER_PASSWORD }}" ]; then
-            echo "::error:: A variável DOCKER_PASSWORD não está definida."
-            exit 1
-          fi
-
-      - name: Logar no Docker Hub
-        uses: docker/login-action@v3
+      # Configurar as credenciais da AWS
+      - name: 🔐 Configurar credenciais da AWS
+        uses: aws-actions/configure-aws-credentials@v2
         with:
-          username: ${{ vars.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-
-      - name: Construir Imagem Docker
-        run: |
-          docker build -t leonardo10sp/tech-challenge:latest .
-
-      - name: Enviar Imagem Docker
-        run: |
-          docker push leonardo10sp/tech-challenge:latest
-
-      - name: Configurar credenciais da AWS
-        uses: aws-actions/configure-aws-credentials@v3
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id: ${{ vars.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}  # Passar o token de sessão
+          aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Configurar kubectl
+      # Verificar e aplicar política de permissão se necessário
+      - name: 🔑 Verificar e aplicar política de permissão
         run: |
-          aws eks update-kubeconfig --name ${{ vars.CLUSTER_NAME }} --region us-east-1
+          POLICY_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:policy/CustomPutRolePolicyPermission"
+          if ! aws iam get-policy --policy-arn $POLICY_ARN 2>/dev/null; then
+            echo "Criando política personalizada para iam:PutRolePolicy..."
+            aws iam create-policy \
+              --policy-name CustomPutRolePolicyPermission \
+              --policy-document '{
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                    "Effect": "Allow",
+                    "Action": "iam:PutRolePolicy",
+                    "Resource": "*"
+                  }
+                ]
+              }'
+          fi
+          echo "Anexando a política à role de execução..."
+          aws iam attach-role-policy \
+            --role-name GitHubActionsRole \
+            --policy-arn $POLICY_ARN
 
-      - name: Aplicar Deployment e Service no Kubernetes
+      # Criar cluster EKS se não existir
+      - name: 🛠️ Criar cluster EKS (se não existir)
         run: |
-          kubectl apply -f src/devOps/k8s/deployment.yaml --validate=true --record --verbose
-          kubectl apply -f src/devOps/k8s/service.yaml --validate=true --record --verbose
+          if ! aws eks describe-cluster --name $CLUSTER_NAME --region $AWS_REGION; then
+            echo "Cluster não encontrado. Criando cluster EKS..."
+            aws eks create-cluster \
+              --name $CLUSTER_NAME \
+              --region $AWS_REGION \
+              --kubernetes-version "1.21" \
+              --role-arn arn:aws:iam::${AWS_ACCOUNT_ID}:role/EKSClusterRole \
+              --resources-vpc-config subnetIds=subnet-xxxxxx,subnet-yyyyyy,securityGroupIds=sg-zzzzzz
+            echo "Cluster EKS criado. Aguardando a finalização da criação..."
+            aws eks wait cluster-active --name $CLUSTER_NAME --region $AWS_REGION
+          else
+            echo "Cluster EKS já existe."
+          fi
+
+      # Criar NodeGroup se não existir
+      - name: 🛠️ Criar NodeGroup (se não existir)
+        run: |
+          if ! aws eks describe-nodegroup --cluster-name $CLUSTER_NAME --nodegroup-name $NODEGROUP_NAME --region $AWS_REGION; then
+            echo "NodeGroup não encontrado. Criando NodeGroup..."
+            aws eks create-nodegroup \
+              --cluster-name $CLUSTER_NAME \
+              --nodegroup-name $NODEGROUP_NAME \
+              --node-role arn:aws:iam::${AWS_ACCOUNT_ID}:role/EKSNodeRole \
+              --subnets subnet-xxxxxx subnet-yyyyyy \
+              --scaling-config minSize=1,maxSize=3,desiredSize=2 \
+              --instance-types t3.medium \
+              --region $AWS_REGION;
+            echo "NodeGroup criado. Aguardando a finalização da criação..."
+            aws eks wait nodegroup-active --cluster-name $CLUSTER_NAME --nodegroup-name $NODEGROUP_NAME --region $AWS_REGION
+          else
+            echo "NodeGroup já existe.";
+          fi
+
+      # Adicionar etapa de criação do repositório no ECR
+      - name: 🛠️ Criar repositório ECR (se não existir)
+        run: |
+          aws ecr describe-repositories --repository-names "tofood/backend" --region $AWS_REGION || \
+          aws ecr create-repository --repository-name "tofood/backend" --region $AWS_REGION
+
+      # Login no Amazon ECR
+      - name: 🐋 Login no Amazon ECR
+        run: |
+          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+      # Build da imagem Docker
+      - name: 🛠️ Build da imagem Docker
+        run: |
+          docker build -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_NAME:latest .
+
+      # Tag da imagem com o SHA do commit
+      - name: 🏷️ Tag da imagem
+        run: |
+          docker tag $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_NAME:latest $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_NAME:${{ github.sha }}
+
+      # Push da imagem para o Amazon ECR
+      - name: 📤 Push da imagem Docker
+        run: |
+          docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_NAME:latest
+          docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_NAME:${{ github.sha }}
+
+      # Configurar o kubectl
+      - name: ⚙️ Configurar kubectl
+        run: |
+          aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
+
+      # Atualizar o Deployment no Kubernetes (EKS)
+      - name: 🚀 Atualizar deployment no EKS
+        run: |
+          kubectl set image deployment/$DEPLOYMENT_NAME tech-challenge-container=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_NAME:latest
+          kubectl rollout status deployment/$DEPLOYMENT_NAME
+
+      # Mostrar as instâncias no cluster
+      - name: 🖥️ Mostrar as instâncias do cluster
+        run: |
+          kubectl get nodes
